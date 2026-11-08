@@ -257,15 +257,117 @@ def commodity_scan_table():
                      "Data Status": "OK" if sum(x != "INSUFFICIENT DATA" for x in signals) >= 2 else "INSUFFICIENT DATA"})
     return pd.DataFrame(rows)
 
+
+
+def supertrend_adx_snapshot(candles: pd.DataFrame, atr_period: int = 10, multiplier: float = 3.0, adx_period: int = 14) -> dict:
+    """Calculate Supertrend direction and Wilder-style ADX from OHLC candles."""
+    required = {"High", "Low", "Close"}
+    empty = {"Close": np.nan, "Supertrend": np.nan, "Trend": "INSUFFICIENT DATA",
+             "ADX": np.nan, "+DI": np.nan, "-DI": np.nan, "Signal": "INSUFFICIENT DATA",
+             "Signal Detail": "Not enough OHLC data"}
+    if candles.empty or not required.issubset(candles.columns) or len(candles) < max(atr_period, adx_period) * 2 + 2:
+        return empty.copy()
+
+    x = candles[["High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna().copy()
+    if len(x) < max(atr_period, adx_period) * 2 + 2:
+        return empty.copy()
+
+    prev_close = x["Close"].shift(1)
+    tr = pd.concat([
+        x["High"] - x["Low"],
+        (x["High"] - prev_close).abs(),
+        (x["Low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / atr_period, min_periods=atr_period, adjust=False).mean()
+
+    midpoint = (x["High"] + x["Low"]) / 2
+    basic_upper = midpoint + multiplier * atr
+    basic_lower = midpoint - multiplier * atr
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+    st_line = pd.Series(np.nan, index=x.index, dtype=float)
+    direction = pd.Series(1, index=x.index, dtype=int)
+
+    for i in range(1, len(x)):
+        if pd.isna(atr.iloc[i]):
+            continue
+        if pd.isna(final_upper.iloc[i-1]):
+            final_upper.iloc[i] = basic_upper.iloc[i]
+            final_lower.iloc[i] = basic_lower.iloc[i]
+        else:
+            final_upper.iloc[i] = (basic_upper.iloc[i] if
+                basic_upper.iloc[i] < final_upper.iloc[i-1] or x["Close"].iloc[i-1] > final_upper.iloc[i-1]
+                else final_upper.iloc[i-1])
+            final_lower.iloc[i] = (basic_lower.iloc[i] if
+                basic_lower.iloc[i] > final_lower.iloc[i-1] or x["Close"].iloc[i-1] < final_lower.iloc[i-1]
+                else final_lower.iloc[i-1])
+        if i == 1 or pd.isna(st_line.iloc[i-1]):
+            direction.iloc[i] = 1 if x["Close"].iloc[i] >= midpoint.iloc[i] else -1
+        elif st_line.iloc[i-1] == final_upper.iloc[i-1]:
+            direction.iloc[i] = 1 if x["Close"].iloc[i] > final_upper.iloc[i] else -1
+        else:
+            direction.iloc[i] = -1 if x["Close"].iloc[i] < final_lower.iloc[i] else 1
+        st_line.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
+
+    up_move = x["High"].diff()
+    down_move = -x["Low"].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    atr_adx = tr.ewm(alpha=1 / adx_period, min_periods=adx_period, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / adx_period, min_periods=adx_period, adjust=False).mean() / atr_adx.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1 / adx_period, min_periods=adx_period, adjust=False).mean() / atr_adx.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1 / adx_period, min_periods=adx_period, adjust=False).mean()
+
+    last = x.iloc[-1]
+    adx_now = float(adx.iloc[-1]) if pd.notna(adx.iloc[-1]) else np.nan
+    pdi_now = float(plus_di.iloc[-1]) if pd.notna(plus_di.iloc[-1]) else np.nan
+    mdi_now = float(minus_di.iloc[-1]) if pd.notna(minus_di.iloc[-1]) else np.nan
+    trend = "BULLISH" if direction.iloc[-1] == 1 else "BEARISH"
+    strong = np.isfinite(adx_now) and adx_now >= 20
+    if not np.isfinite(adx_now):
+        signal, detail = "INSUFFICIENT DATA", "ADX is not available"
+    elif not strong:
+        signal, detail = "MIXED", "Weak trend: ADX below 20"
+    elif trend == "BULLISH" and pdi_now > mdi_now:
+        signal, detail = "BULLISH", "Supertrend bullish; ADX confirms trend strength"
+    elif trend == "BEARISH" and mdi_now > pdi_now:
+        signal, detail = "BEARISH", "Supertrend bearish; ADX confirms trend strength"
+    else:
+        signal, detail = "MIXED", "Supertrend and directional movement do not align"
+    return {"Close": float(last["Close"]), "Supertrend": float(st_line.iloc[-1]) if pd.notna(st_line.iloc[-1]) else np.nan,
+            "Trend": trend, "ADX": adx_now, "+DI": pdi_now, "-DI": mdi_now,
+            "Signal": signal, "Signal Detail": detail}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def supertrend_adx_table(universe_name: str, atr_period: int, multiplier: float, adx_period: int) -> pd.DataFrame:
+    if universe_name == "Stocks":
+        universe = {ticker: name for ticker, name in STOCKS.items()}
+    elif universe_name == "Sectors":
+        universe = {ticker: name for name, ticker in SECTORS.items()}
+    elif universe_name == "Themes":
+        universe = {ticker: name for name, ticker in THEMES.items()}
+    elif universe_name == "Forex":
+        universe = {ticker: name for name, ticker in FOREX_PAIRS.items()}
+    else:
+        universe = {ticker: name for name, ticker in COMMODITIES.items()}
+    rows = []
+    for ticker, name in universe.items():
+        candles = download_history(ticker, "2y", "1d")
+        snap = supertrend_adx_snapshot(candles, atr_period, multiplier, adx_period)
+        rows.append({"Asset": name, "Ticker": ticker, **snap,
+                     "Data Status": "OK" if snap["Signal"] != "INSUFFICIENT DATA" else "INSUFFICIENT DATA"})
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame["_priority"] = frame["Signal"].map({"BULLISH": 0, "BEARISH": 1, "MIXED": 2, "INSUFFICIENT DATA": 3}).fillna(4)
+        frame = frame.sort_values(["_priority", "ADX"], ascending=[True, False], na_position="last").drop(columns="_priority").reset_index(drop=True)
+        frame.insert(0, "Rank", np.arange(1, len(frame) + 1))
+    return frame
+
+
 st.set_page_config(page_title=APP_NAME, page_icon="📊", layout="wide")
-st.markdown("""
-<style>
-.block-container {padding-top: 1.1rem; padding-bottom: 2rem;}
-.signal-bull {color:#14804a;font-weight:700}
-.signal-bear {color:#d62728;font-weight:700}
-.signal-mixed {color:#b8860b;font-weight:700}
-</style>
-""", unsafe_allow_html=True)
+st.markdown(""" <style> .block-container {padding-top: 1.1rem; padding-bottom: 2rem;} .signal-bull {color:#14804a;font-weight:700} .signal-bear {color:#d62728;font-weight:700} .signal-mixed {color:#b8860b;font-weight:700} </style> """, unsafe_allow_html=True)
 
 @st.cache_data(ttl=300, show_spinner=False)
 def download_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
@@ -499,7 +601,7 @@ with st.sidebar:
     st.write("5 SMA · 10 SMA · 21 SMA · 20 HMA")
     st.caption("Yahoo Finance data may be delayed or limited, especially for intraday candles.")
 
-tabs = st.tabs(["🏆 Market Leaders", "🌟 Theme Leaders", "🔄 Market Rotation", "🎯 Trade Setup & Risk", "Market Overview", "Top Opportunities", "High RS Stocks", "Sector Rankings", "Theme Rankings", "Stock Scanner", "Forex Scanner", "Commodity Scanner", "Signal History", "Methodology"])
+tabs = st.tabs(["🏆 Market Leaders", "🌟 Theme Leaders", "🔄 Market Rotation", "🎯 Trade Setup & Risk", "Market Overview", "Top Opportunities", "High RS Stocks", "Sector Rankings", "Theme Rankings", "Stock Scanner", "Forex Scanner", "Commodity Scanner", "Signal History", "Methodology", "Super Trend + ADX"])
 
 with tabs[1]:
     st.subheader("🌟 Theme Leaders: Bullish Sector → Bullish Theme → Theme Leaders")
@@ -1067,41 +1169,7 @@ with tabs[12]:
 
 with tabs[13]:
     st.subheader("Methodology and limitations")
-    st.markdown("""
-**Benchmark**
-- **SPY:** S&P 500 ETF benchmark. All stock, sector, and theme comparisons use SPY only.
-
-**Relative strength**
-- Each sector, theme ETF, or stock's total return is measured over 1, 3, 6, and 12 months.
-- Relative strength versus a benchmark is asset return minus benchmark return, expressed in percentage points.
-- The **SPY RS Score** averages the 3-month and 6-month relative returns versus SPY. It is a ranking metric, not a forecast.
-- **High RS Stocks** filters for stocks positive versus SPY across both 3-month and 6-month periods, then ranks by average excess return.
-- **Signal Quality** is a 0-100 rule-alignment score using trend structure, relative strength, RSI, and recent momentum. It is not a probability of profit.
-- **BULLISH** means both 3-month and 6-month relative returns beat SPY; **BEARISH** means both underperform SPY; **MIXED** means the periods disagree or are not both positive/negative.
-
-**Trend indicators**
-- Market benchmarks use 5 SMA, 10 SMA, 21 SMA, and 20 HMA on 1-hour, 4-hour, and daily candles.
-- Four-hour bars are aggregated from hourly bars; session boundaries and incomplete candles can affect intraday readings.
-
-**Forex**
-- Forex pairs use 1-hour, 4-hour (aggregated from hourly bars), and daily candles with EMA 20, EMA 50, RSI(14), and 10-candle momentum.
-- Multi-timeframe classifications require agreement from available timeframes; disagreement is shown as mixed. Signal quality measures timeframe alignment, not probability of profit.
-- Forex data availability and intraday history are controlled by Yahoo Finance.
-
-**Commodities**
-- Commodity futures use 1-hour, 4-hour (aggregated from hourly bars), and daily candles with EMA 20, EMA 50, RSI(14), and 10-candle momentum.
-- Multi-timeframe classifications require agreement from available timeframes; disagreement is shown as mixed. Futures symbols may have limited or unavailable intraday data, and continuous futures prices are not the same as a specific tradable contract.
-
-**Data**
-- Prices are obtained from Yahoo Finance through `yfinance`; availability, timestamps, and historical coverage are controlled by the provider.
-- The app caches results briefly to reduce repeated requests. Use **Refresh market data** to clear the cache and request new values.
-- Scanner tables include a Data Status column where applicable. The app shows a check timestamp, which is not a guarantee that every provider quote is current.
-- If data is missing or stale, verify the provider's response before relying on the reading.
-- The Signal History tab records manual snapshots in the current session. Download the CSV to preserve the journal; app sessions may reset after reconnects or redeployments.
-
-**Important**
-This tool is for market research and education, not financial advice. Signals are rule-based and may be wrong. Always independently verify data and manage risk.
-""")
+    st.markdown(""" **Benchmark** - **SPY:** S&P 500 ETF benchmark. All stock, sector, and theme comparisons use SPY only. **Relative strength** - Each sector, theme ETF, or stock's total return is measured over 1, 3, 6, and 12 months. - Relative strength versus a benchmark is asset return minus benchmark return, expressed in percentage points. - The **SPY RS Score** averages the 3-month and 6-month relative returns versus SPY. It is a ranking metric, not a forecast. - **High RS Stocks** filters for stocks positive versus SPY across both 3-month and 6-month periods, then ranks by average excess return. - **Signal Quality** is a 0-100 rule-alignment score using trend structure, relative strength, RSI, and recent momentum. It is not a probability of profit. - **BULLISH** means both 3-month and 6-month relative returns beat SPY; **BEARISH** means both underperform SPY; **MIXED** means the periods disagree or are not both positive/negative. **Trend indicators** - Market benchmarks use 5 SMA, 10 SMA, 21 SMA, and 20 HMA on 1-hour, 4-hour, and daily candles. - Four-hour bars are aggregated from hourly bars; session boundaries and incomplete candles can affect intraday readings. **Forex** - Forex pairs use 1-hour, 4-hour (aggregated from hourly bars), and daily candles with EMA 20, EMA 50, RSI(14), and 10-candle momentum. - Multi-timeframe classifications require agreement from available timeframes; disagreement is shown as mixed. Signal quality measures timeframe alignment, not probability of profit. - Forex data availability and intraday history are controlled by Yahoo Finance. **Commodities** - Commodity futures use 1-hour, 4-hour (aggregated from hourly bars), and daily candles with EMA 20, EMA 50, RSI(14), and 10-candle momentum. - Multi-timeframe classifications require agreement from available timeframes; disagreement is shown as mixed. Futures symbols may have limited or unavailable intraday data, and continuous futures prices are not the same as a specific tradable contract. **Data** - Prices are obtained from Yahoo Finance through `yfinance`; availability, timestamps, and historical coverage are controlled by the provider. - The app caches results briefly to reduce repeated requests. Use **Refresh market data** to clear the cache and request new values. - Scanner tables include a Data Status column where applicable. The app shows a check timestamp, which is not a guarantee that every provider quote is current. - If data is missing or stale, verify the provider's response before relying on the reading. - The Signal History tab records manual snapshots in the current session. Download the CSV to preserve the journal; app sessions may reset after reconnects or redeployments. **Important** This tool is for market research and education, not financial advice. Signals are rule-based and may be wrong. Always independently verify data and manage risk. """)
     st.write("No email-alert code, SMTP settings, or scheduled email workflow is included in this project.")
 
 with tabs[0]:
@@ -1235,3 +1303,73 @@ with tabs[0]:
 
         st.caption("Score interpretation: stocks use Signal Quality oriented to the stock's SPY-relative classification; forex and commodities use timeframe alignment for bullish/bearish signals. Mixed signals receive a score of zero so they appear lower in this directional leaderboard. This is a research ranking—not a buy/sell instruction.")
 
+
+with tabs[14]:
+    st.subheader("📈 Super Trend + ADX Dashboard")
+    st.markdown(
+        "<div style='background:linear-gradient(110deg,#102a43,#166534);color:white;padding:16px 18px;border-radius:12px;margin-bottom:12px'>"
+        "<div style='font-size:1.3rem;font-weight:800'>TREND DIRECTION + TREND STRENGTH</div>"
+        "<div style='margin-top:5px'>Supertrend identifies directional bias; ADX and directional indicators help filter weaker or conflicting setups.</div></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Daily candles are used. ADX measures trend strength, not direction; the dashboard combines ADX with Supertrend and +DI/−DI. These are screening signals, not trade instructions.")
+    c1, c2, c3, c4 = st.columns(4)
+    market_choice = c1.selectbox("Market universe", ["Stocks", "Sectors", "Themes", "Forex", "Commodities"], key="st_adx_market")
+    atr_period = c2.selectbox("Supertrend ATR period", [7, 10, 14, 20], index=1, key="st_adx_atr")
+    multiplier = c3.selectbox("Supertrend multiplier", [2.0, 2.5, 3.0, 3.5, 4.0], index=2, key="st_adx_mult")
+    adx_period = c4.selectbox("ADX period", [7, 10, 14, 20], index=2, key="st_adx_period")
+    if st.button("🔄 Refresh Super Trend + ADX", key="refresh_supertrend_adx"):
+        st.cache_data.clear()
+        st.rerun()
+
+    with st.spinner(f"Calculating Supertrend and ADX for {market_choice.lower()}..."):
+        st_adx = supertrend_adx_table(market_choice, atr_period, multiplier, adx_period)
+
+    if st_adx.empty:
+        st.warning("No data was returned for this universe. Try refreshing later.")
+    else:
+        bullish_n = int((st_adx["Signal"] == "BULLISH").sum())
+        bearish_n = int((st_adx["Signal"] == "BEARISH").sum())
+        mixed_n = int((st_adx["Signal"] == "MIXED").sum())
+        insufficient_n = int((st_adx["Signal"] == "INSUFFICIENT DATA").sum())
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("🟢 Bullish confirmed", bullish_n)
+        m2.metric("🔴 Bearish confirmed", bearish_n)
+        m3.metric("🟡 Mixed / weak", mixed_n)
+        m4.metric("⚪ Insufficient data", insufficient_n)
+
+        filter_choice = st.selectbox("Show signals", ["All signals", "BULLISH", "BEARISH", "MIXED", "INSUFFICIENT DATA"], key="st_adx_filter")
+        min_adx = st.slider("Minimum ADX strength (for confirmed signals)", 0, 50, 20, 5, key="st_adx_min")
+        view = st_adx.copy()
+        if filter_choice != "All signals":
+            view = view[view["Signal"] == filter_choice]
+        if filter_choice in ("All signals", "BULLISH", "BEARISH"):
+            view = view[(view["Signal"].isin(["MIXED", "INSUFFICIENT DATA"])) | (pd.to_numeric(view["ADX"], errors="coerce") >= min_adx)]
+        if view.empty:
+            st.info("No assets match these filters.")
+        else:
+            def paint_st_adx(row):
+                signal = str(row.get("Signal", ""))
+                color = ("background-color:#d9f2e3;color:#146c43;font-weight:700" if signal == "BULLISH"
+                         else "background-color:#f8d7da;color:#842029;font-weight:700" if signal == "BEARISH"
+                         else "background-color:#fff3cd;color:#856404;font-weight:700" if signal == "MIXED"
+                         else "background-color:#f3f4f6;color:#374151")
+                return [color if col in ("Signal", "Trend") else "" for col in row.index]
+            display = view.copy()
+            display["Close"] = pd.to_numeric(display["Close"], errors="coerce")
+            display["Supertrend"] = pd.to_numeric(display["Supertrend"], errors="coerce")
+            display = display.rename(columns={"ADX": f"ADX ({adx_period})"})
+            adx_col = f"ADX ({adx_period})"
+            st.dataframe(display.style.apply(paint_st_adx, axis=1).format(
+                {"Close": "{:,.4f}", "Supertrend": "{:,.4f}", adx_col: "{:.1f}", "+DI": "{:.1f}", "-DI": "{:.1f}"},
+                na_rep="—"), use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Download Super Trend + ADX CSV", view.to_csv(index=False),
+                               "baldeh_supertrend_adx.csv", "text/csv")
+        with st.expander("How to interpret this dashboard"):
+            st.markdown(
+                "- **Bullish (green):** Supertrend is bullish, ADX is at least 20, and +DI is above −DI.\n"
+                "- **Bearish (red):** Supertrend is bearish, ADX is at least 20, and −DI is above +DI.\n"
+                "- **Mixed / weak (yellow):** ADX is below 20 or Supertrend and directional movement disagree.\n"
+                "- ADX does not tell you bullish or bearish direction; it only estimates trend strength. A strong ADX reading can occur in either direction.\n"
+                "- Data uses daily Yahoo Finance candles and may be delayed, incomplete, or unavailable for some symbols. Verify signals independently before making decisions."
+            )
