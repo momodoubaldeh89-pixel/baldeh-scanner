@@ -601,7 +601,7 @@ with st.sidebar:
     st.write("5 SMA · 10 SMA · 21 SMA · 20 HMA")
     st.caption("Yahoo Finance data may be delayed or limited, especially for intraday candles.")
 
-tabs = st.tabs(["🏆 Market Leaders", "🌟 Theme Leaders", "🔄 Market Rotation", "🎯 Trade Setup & Risk", "Market Overview", "Top Opportunities", "High RS Stocks", "Sector Rankings", "Theme Rankings", "Stock Scanner", "Forex Scanner", "Commodity Scanner", "Signal History", "Methodology", "Super Trend + ADX"])
+tabs = st.tabs(["🏆 Market Leaders", "🌟 Theme Leaders", "🔄 Market Rotation", "🎯 Trade Setup & Risk", "Market Overview", "Top Opportunities", "High RS Stocks", "Sector Rankings", "Theme Rankings", "Stock Scanner", "Forex Scanner", "Commodity Scanner", "Signal History", "Methodology", "SuperTrend + ADX"])
 
 with tabs[1]:
     st.subheader("🌟 Theme Leaders: Bullish Sector → Bullish Theme → Theme Leaders")
@@ -1304,72 +1304,141 @@ with tabs[0]:
         st.caption("Score interpretation: stocks use Signal Quality oriented to the stock's SPY-relative classification; forex and commodities use timeframe alignment for bullish/bearish signals. Mixed signals receive a score of zero so they appear lower in this directional leaderboard. This is a research ranking—not a buy/sell instruction.")
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def supertrend_adx_stock_categories() -> dict:
+    """Rank qualifying stocks into five daily SuperTrend + ADX categories."""
+    categories = {
+        "Long-Term Bullish": [],
+        "Long-Term Bearish": [],
+        "Short-Term Bullish": [],
+        "Short-Term Bearish": [],
+        "Sideways Market": [],
+    }
+    for ticker, name in STOCKS.items():
+        candles = download_history(ticker, "2y", "1d")
+        if candles.empty or not {"High", "Low", "Close"}.issubset(candles.columns) or len(candles) < 80:
+            continue
+        fast = supertrend_adx_snapshot(candles, 10, 2.5, 14)
+        slow = supertrend_adx_snapshot(candles, 22, 3.5, 14)
+        if fast["Signal"] == "INSUFFICIENT DATA" or slow["Signal"] == "INSUFFICIENT DATA":
+            continue
+        close = pd.to_numeric(candles["Close"], errors="coerce").dropna()
+        if len(close) < 22:
+            continue
+        price = float(close.iloc[-1])
+        momentum_20d = (price / float(close.iloc[-21]) - 1) * 100 if float(close.iloc[-21]) else np.nan
+        momentum_5d = (price / float(close.iloc[-6]) - 1) * 100 if float(close.iloc[-6]) else np.nan
+        fast_trend, slow_trend = fast["Trend"], slow["Trend"]
+        adx = fast["ADX"]
+        pdi, mdi = fast["+DI"], fast["-DI"]
+        adx_strong = np.isfinite(adx) and adx >= 20
+        direction_bull = np.isfinite(pdi) and np.isfinite(mdi) and pdi > mdi
+        direction_bear = np.isfinite(pdi) and np.isfinite(mdi) and mdi > pdi
+        aligned_bull = fast_trend == "BULLISH" and slow_trend == "BULLISH"
+        aligned_bear = fast_trend == "BEARISH" and slow_trend == "BEARISH"
+
+        # Scores reward trend agreement, stronger ADX, positive/negative momentum,
+        # and a confirming recent move. These are ranking factors, not predictions.
+        strength = min(float(adx), 50.0) if np.isfinite(adx) else 0.0
+        bull_momentum = max(min(momentum_20d, 30), -30) if np.isfinite(momentum_20d) else 0
+        bear_momentum = max(min(-momentum_20d, 30), -30) if np.isfinite(momentum_20d) else 0
+        recent_bull = max(min(momentum_5d, 10), -10) if np.isfinite(momentum_5d) else 0
+        recent_bear = max(min(-momentum_5d, 10), -10) if np.isfinite(momentum_5d) else 0
+        agreement = 20 if fast_trend == slow_trend else 0
+        bull_score = agreement + strength + bull_momentum + recent_bull + (10 if direction_bull else 0)
+        bear_score = agreement + strength + bear_momentum + recent_bear + (10 if direction_bear else 0)
+        row = {
+            "Stock": name, "Ticker": ticker, "Latest Price": price,
+            "Classification": "", "Fast SuperTrend": fast_trend,
+            "Slow SuperTrend": slow_trend, "ADX (14)": adx,
+            "+DI": pdi, "-DI": mdi, "20-Day Momentum %": momentum_20d,
+            "5-Day Momentum %": momentum_5d, "Bull Rank Score": bull_score,
+            "Bear Rank Score": bear_score,
+        }
+        if aligned_bull and adx_strong and direction_bull:
+            row["Classification"] = "Long-Term Bullish"
+            row["Rank Score"] = bull_score + 15
+            categories["Long-Term Bullish"].append(row)
+        elif aligned_bear and adx_strong and direction_bear:
+            row["Classification"] = "Long-Term Bearish"
+            row["Rank Score"] = bear_score + 15
+            categories["Long-Term Bearish"].append(row)
+        elif fast_trend == "BULLISH" and direction_bull and adx_strong and not aligned_bull:
+            row["Classification"] = "Short-Term Bullish"
+            row["Rank Score"] = bull_score
+            categories["Short-Term Bullish"].append(row)
+        elif fast_trend == "BEARISH" and direction_bear and adx_strong and not aligned_bear:
+            row["Classification"] = "Short-Term Bearish"
+            row["Rank Score"] = bear_score
+            categories["Short-Term Bearish"].append(row)
+        elif (not adx_strong and (fast_trend != slow_trend or fast["Signal"] == "MIXED" or slow["Signal"] == "MIXED")) or (fast_trend != slow_trend and not (adx_strong and ((fast_trend == "BULLISH" and direction_bull) or (fast_trend == "BEARISH" and direction_bear)))):
+            row["Classification"] = "Sideways Market"
+            row["Rank Score"] = (50 - strength) + (10 if abs(momentum_20d) < 3 else 0) - abs(momentum_5d if np.isfinite(momentum_5d) else 0)
+            categories["Sideways Market"].append(row)
+
+    for category, rows in categories.items():
+        if category == "Sideways Market":
+            rows.sort(key=lambda r: r["Rank Score"], reverse=True)
+        else:
+            rows.sort(key=lambda r: r["Rank Score"], reverse=True)
+        categories[category] = rows[:5]
+    return categories
+
+
 with tabs[14]:
-    st.subheader("📈 Super Trend + ADX Dashboard")
+    st.subheader("📈 SuperTrend + ADX Dashboard")
     st.markdown(
         "<div style='background:linear-gradient(110deg,#102a43,#166534);color:white;padding:16px 18px;border-radius:12px;margin-bottom:12px'>"
-        "<div style='font-size:1.3rem;font-weight:800'>TREND DIRECTION + TREND STRENGTH</div>"
-        "<div style='margin-top:5px'>Supertrend identifies directional bias; ADX and directional indicators help filter weaker or conflicting setups.</div></div>",
+        "<div style='font-size:1.3rem;font-weight:800'>FIVE STOCK LEADERS IN FIVE TREND CATEGORIES</div>"
+        "<div style='margin-top:5px'>Daily fast and slow SuperTrend signals, confirmed by ADX and directional movement.</div></div>",
         unsafe_allow_html=True,
     )
-    st.caption("Daily candles are used. ADX measures trend strength, not direction; the dashboard combines ADX with Supertrend and +DI/−DI. These are screening signals, not trade instructions.")
-    c1, c2, c3, c4 = st.columns(4)
-    market_choice = c1.selectbox("Market universe", ["Stocks", "Sectors", "Themes", "Forex", "Commodities"], key="st_adx_market")
-    atr_period = c2.selectbox("Supertrend ATR period", [7, 10, 14, 20], index=1, key="st_adx_atr")
-    multiplier = c3.selectbox("Supertrend multiplier", [2.0, 2.5, 3.0, 3.5, 4.0], index=2, key="st_adx_mult")
-    adx_period = c4.selectbox("ADX period", [7, 10, 14, 20], index=2, key="st_adx_period")
-    if st.button("🔄 Refresh Super Trend + ADX", key="refresh_supertrend_adx"):
+    st.caption("Settings from your example: Fast SuperTrend ATR 10 × 2.5; Slow SuperTrend ATR 22 × 3.5; ADX 14 with reference levels 20 and 25. Each category shows up to five qualifying stocks—no placeholders are added if fewer qualify.")
+    if st.button("🔄 Refresh SuperTrend + ADX", key="refresh_supertrend_adx"):
         st.cache_data.clear()
         st.rerun()
+    with st.spinner("Scanning stocks using daily SuperTrend and ADX indicators..."):
+        category_results = supertrend_adx_stock_categories()
 
-    with st.spinner(f"Calculating Supertrend and ADX for {market_choice.lower()}..."):
-        st_adx = supertrend_adx_table(market_choice, atr_period, multiplier, adx_period)
+    definitions = [
+        ("Long-Term Bullish", "🟢", "#d9f2e3", "#146c43", "Both fast and slow SuperTrend bullish, with ADX ≥ 20 and +DI > −DI."),
+        ("Long-Term Bearish", "🔴", "#f8d7da", "#842029", "Both fast and slow SuperTrend bearish, with ADX ≥ 20 and −DI > +DI."),
+        ("Short-Term Bullish", "🟢", "#d9f2e3", "#146c43", "Fast SuperTrend bullish while the slow trend has not confirmed, supported by ADX ≥ 20 and +DI > −DI."),
+        ("Short-Term Bearish", "🔴", "#f8d7da", "#842029", "Fast SuperTrend bearish while the slow trend has not confirmed, supported by ADX ≥ 20 and −DI > +DI."),
+        ("Sideways Market", "🟡", "#fff3cd", "#856404", "Weak or conflicting trend evidence; ADX below 20 can support this classification but does not decide it alone."),
+    ]
+    total_selected = sum(len(v) for v in category_results.values())
+    st.metric("Stocks selected across all categories", total_selected, help="Maximum 25; stocks must qualify for the category to be included.")
+    for category, emoji, bg, fg, explanation in definitions:
+        rows = category_results[category]
+        st.markdown(f"<div style='background:{bg};color:{fg};padding:10px 14px;border-radius:9px;font-size:1.08rem;font-weight:800;margin-top:14px'>{emoji} {category} — {len(rows)} qualifying stock{'s' if len(rows) != 1 else ''}</div>", unsafe_allow_html=True)
+        st.caption(explanation)
+        if not rows:
+            st.info("No stocks currently qualify for this category. Refresh after the next data update.")
+            continue
+        table = pd.DataFrame(rows)
+        table.insert(0, "Rank", range(1, len(table) + 1))
+        visible_cols = ["Rank", "Stock", "Ticker", "Latest Price", "Classification", "Fast SuperTrend", "Slow SuperTrend", "ADX (14)", "+DI", "-DI", "20-Day Momentum %", "5-Day Momentum %"]
+        table = table[visible_cols]
+        def paint_category_row(row):
+            return [f"background-color:{bg};color:{fg};font-weight:600" if col in ("Classification", "Fast SuperTrend", "Slow SuperTrend") else "" for col in row.index]
+        st.dataframe(table.style.apply(paint_category_row, axis=1).format({
+            "Latest Price": "{:,.2f}", "ADX (14)": "{:.1f}", "+DI": "{:.1f}", "-DI": "{:.1f}",
+            "20-Day Momentum %": "{:+.2f}%", "5-Day Momentum %": "{:+.2f}%"
+        }, na_rep="—"), use_container_width=True, hide_index=True)
 
-    if st_adx.empty:
-        st.warning("No data was returned for this universe. Try refreshing later.")
-    else:
-        bullish_n = int((st_adx["Signal"] == "BULLISH").sum())
-        bearish_n = int((st_adx["Signal"] == "BEARISH").sum())
-        mixed_n = int((st_adx["Signal"] == "MIXED").sum())
-        insufficient_n = int((st_adx["Signal"] == "INSUFFICIENT DATA").sum())
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("🟢 Bullish confirmed", bullish_n)
-        m2.metric("🔴 Bearish confirmed", bearish_n)
-        m3.metric("🟡 Mixed / weak", mixed_n)
-        m4.metric("⚪ Insufficient data", insufficient_n)
-
-        filter_choice = st.selectbox("Show signals", ["All signals", "BULLISH", "BEARISH", "MIXED", "INSUFFICIENT DATA"], key="st_adx_filter")
-        min_adx = st.slider("Minimum ADX strength (for confirmed signals)", 0, 50, 20, 5, key="st_adx_min")
-        view = st_adx.copy()
-        if filter_choice != "All signals":
-            view = view[view["Signal"] == filter_choice]
-        if filter_choice in ("All signals", "BULLISH", "BEARISH"):
-            view = view[(view["Signal"].isin(["MIXED", "INSUFFICIENT DATA"])) | (pd.to_numeric(view["ADX"], errors="coerce") >= min_adx)]
-        if view.empty:
-            st.info("No assets match these filters.")
-        else:
-            def paint_st_adx(row):
-                signal = str(row.get("Signal", ""))
-                color = ("background-color:#d9f2e3;color:#146c43;font-weight:700" if signal == "BULLISH"
-                         else "background-color:#f8d7da;color:#842029;font-weight:700" if signal == "BEARISH"
-                         else "background-color:#fff3cd;color:#856404;font-weight:700" if signal == "MIXED"
-                         else "background-color:#f3f4f6;color:#374151")
-                return [color if col in ("Signal", "Trend") else "" for col in row.index]
-            display = view.copy()
-            display["Close"] = pd.to_numeric(display["Close"], errors="coerce")
-            display["Supertrend"] = pd.to_numeric(display["Supertrend"], errors="coerce")
-            display = display.rename(columns={"ADX": f"ADX ({adx_period})"})
-            adx_col = f"ADX ({adx_period})"
-            st.dataframe(display.style.apply(paint_st_adx, axis=1).format(
-                {"Close": "{:,.4f}", "Supertrend": "{:,.4f}", adx_col: "{:.1f}", "+DI": "{:.1f}", "-DI": "{:.1f}"},
-                na_rep="—"), use_container_width=True, hide_index=True)
-            st.download_button("⬇️ Download Super Trend + ADX CSV", view.to_csv(index=False),
-                               "baldeh_supertrend_adx.csv", "text/csv")
-        with st.expander("How to interpret this dashboard"):
-            st.markdown(
-                "- **Bullish (green):** Supertrend is bullish, ADX is at least 20, and +DI is above −DI.\n"
-                "- **Bearish (red):** Supertrend is bearish, ADX is at least 20, and −DI is above +DI.\n"
-                "- **Mixed / weak (yellow):** ADX is below 20 or Supertrend and directional movement disagree.\n"
-                "- ADX does not tell you bullish or bearish direction; it only estimates trend strength. A strong ADX reading can occur in either direction.\n"
-                "- Data uses daily Yahoo Finance candles and may be delayed, incomplete, or unavailable for some symbols. Verify signals independently before making decisions."
-            )
+    all_rows = []
+    for category, rows in category_results.items():
+        for rank, row in enumerate(rows, start=1):
+            all_rows.append({"Category Rank": rank, **row})
+    if all_rows:
+        st.download_button("⬇️ Download SuperTrend + ADX category results (CSV)", pd.DataFrame(all_rows).to_csv(index=False),
+                           "baldeh_supertrend_adx_categories.csv", "text/csv")
+    with st.expander("How the five categories work"):
+        st.markdown(
+            "- **Long-Term Bullish/Bearish:** fast and slow daily SuperTrend agree, ADX is at least 20, and +DI/−DI confirms direction.\n"
+            "- **Short-Term Bullish/Bearish:** the fast SuperTrend and directional movement agree with ADX at least 20, but the slow SuperTrend has not yet confirmed the same direction.\n"
+            "- **Sideways Market:** trend evidence is weak or conflicting; ADX is considered alongside SuperTrend alignment and recent momentum.\n"
+            "- Stocks are ranked within each category using SuperTrend agreement, ADX strength, 20-day momentum, 5-day price action, and directional confirmation. ADX 25 is a stronger-trend reference, not a separate eligibility requirement.\n"
+            "- The scanner uses daily Yahoo Finance data. Some symbols may have delayed or missing data. This is a research tool, not investment advice."
+        )
